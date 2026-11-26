@@ -9,9 +9,15 @@ from flask_cors import CORS
 from pypdf import PdfReader
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}}, allow_headers=["Content-Type", "Authorization"], methods=["GET", "POST", "OPTIONS"])
 
-SECRET_KEY = os.getenv("SECRET_KEY", "smartlab-secret-key-2026")
+CORS(
+    app,
+    resources={r"/*": {"origins": "*"}},
+    allow_headers=["Content-Type", "Authorization"],
+    methods=["GET", "POST", "OPTIONS"]
+)
+
+SECRET_KEY = os.getenv("SECRET_KEY", "clave-secreta-smartlab-2026")
 DB_HOST = os.getenv("DB_HOST", "localhost")
 DB_PORT = os.getenv("DB_PORT", "5432")
 DB_NAME = os.getenv("DB_NAME", "postgres")
@@ -20,10 +26,13 @@ DB_PASSWORD = os.getenv("DB_PASSWORD", "postgres")
 
 PDF_PATH = os.path.join(os.path.dirname(__file__), "pdf", "informacion.pdf")
 
+# Estado global sincronizado con Wokwi, Vercel y Streamlit
 iot_state = {
     "led": False,
-    "temperatura": 23.5,
-    "humedad": 52.0,
+    "modo_auto": False,
+    "alerta_termica": False,
+    "temperatura": 24.5,
+    "humedad": 50.0,
     "actualizado_por": "sistema"
 }
 
@@ -37,11 +46,15 @@ SECCIONES = {
     "temperatura": "Protocolo de Climatización",
     "ventilador": "Protocolo de Climatización",
     "calor": "Protocolo de Climatización",
+    "protocolo": "Protocolo de Climatización",
     "ciberseguridad": "Ingeniería en Ciberseguridad",
+    "ingenieria en ciberseguridad": "Ingeniería en Ciberseguridad",
     "sistemas": "Ingeniería de Sistemas de Información",
+    "ingenieria de sistemas": "Ingeniería de Sistemas de Información",
     "software": "Ingeniería de Software",
-    "datos": "Ciencia de Datos e Inteligencia Artificial",
-    "inteligencia artificial": "Ciencia de Datos e Inteligencia Artificial"
+    "ingenieria de software": "Ingeniería de Software",
+    "ciencia de datos": "Ciencia de Datos e Inteligencia Artificial",
+    "inteligencia artificial": "Ciencia de Datos e Inteligencia Artificial",
 }
 
 def token_required(func):
@@ -53,52 +66,55 @@ def token_required(func):
         try:
             token = token.replace("Bearer ", "")
             datos = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-        except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
-            return jsonify({"mensaje": "Token inválido o expirado"}), 401
+        except jwt.ExpiredSignatureError:
+            return jsonify({"mensaje": "Token expirado"}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({"mensaje": "Token inválido"}), 401
         return func(datos, *args, **kwargs)
     return decorated
 
 def normalizar(texto):
     texto = texto.lower().strip()
     texto = re.sub(r"[¿?¡!.,;:]", " ", texto)
-    for origen, destino in [("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u")]:
-        texto = texto.replace(origen, destino)
+    for orig, dest in [("á", "a"), ("é", "e"), ("í", "i"), ("ó", "o"), ("ú", "u")]:
+        texto = texto.replace(orig, dest)
     return re.sub(r"\s+", " ", texto)
 
 def leer_pdf():
     if not os.path.exists(PDF_PATH):
-        raise FileNotFoundError(f"No existe el archivo {PDF_PATH}")
+        raise FileNotFoundError(f"No se encontró el PDF: {PDF_PATH}")
     lector = PdfReader(PDF_PATH)
     return "\n".join([(pagina.extract_text() or "") for pagina in lector.pages])
 
 def extraer_secciones(texto):
-    titulos = [
+    nombres = [
         "Protocolo de Climatización",
         "Ingeniería en Ciberseguridad",
         "Ingeniería de Sistemas de Información",
         "Ingeniería de Software",
         "Ciencia de Datos e Inteligencia Artificial",
-        "Información institucional"
+        "Información institucional",
     ]
-    pos = []
-    for t in titulos:
-        for match in re.finditer(re.escape(t), texto, re.IGNORECASE):
-            pos.append((match.start(), t))
-    pos.sort(key=lambda x: x[0])
-    resultado = {}
-    for i, (inicio, titulo) in enumerate(pos):
-        fin = pos[i + 1][0] if i + 1 < len(pos) else len(texto)
-        resultado[titulo] = texto[inicio:fin].strip()
-    return resultado
+    posiciones = []
+    for nombre in nombres:
+        for coincidencia in re.finditer(re.escape(nombre), texto, re.IGNORECASE):
+            posiciones.append((coincidencia.start(), nombre))
+    posiciones.sort(key=lambda x: x[0])
+
+    secciones = {}
+    for indice, (inicio, nombre) in enumerate(posiciones):
+        fin = posiciones[indice + 1][0] if indice + 1 < len(posiciones) else len(texto)
+        secciones[nombre] = texto[inicio:fin].strip()
+    return secciones
 
 def detectar_seccion(pregunta):
-    preg = normalizar(pregunta)
+    pregunta_norm = normalizar(pregunta)
     for clave, seccion in sorted(SECCIONES.items(), key=lambda x: len(x[0]), reverse=True):
-        if clave in preg:
+        if clave in pregunta_norm:
             return seccion
     return None
 
-def obtener_db():
+def obtener_conexion():
     return psycopg2.connect(
         host=DB_HOST,
         port=DB_PORT,
@@ -108,119 +124,225 @@ def obtener_db():
         sslmode="require" if "supabase.com" in DB_HOST else "prefer"
     )
 
-def guardar_chat(pregunta, respuesta):
+def guardar_conversacion(pregunta, respuesta):
     try:
-        conn = obtener_db()
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO conversaciones (pregunta, respuesta) VALUES (%s, %s)", (pregunta, respuesta))
-        conn.commit()
-        conn.close()
+        conexion = obtener_conexion()
+        with conexion.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO conversaciones (pregunta, respuesta) VALUES (%s, %s)",
+                (pregunta, respuesta),
+            )
+        conexion.commit()
+        conexion.close()
     except Exception as e:
-        print("Error al guardar chat:", e)
+        print("Aviso BD chat:", e)
 
 def registrar_telemetria(temp, hum, led):
     try:
-        conn = obtener_db()
-        with conn.cursor() as cur:
-            cur.execute("INSERT INTO mediciones_iot (temperatura, humedad, estado_led) VALUES (%s, %s, %s)", (temp, hum, led))
-        conn.commit()
-        conn.close()
+        conexion = obtener_conexion()
+        with conexion.cursor() as cursor:
+            cursor.execute(
+                "INSERT INTO mediciones_iot (temperatura, humedad, estado_led) VALUES (%s, %s, %s)",
+                (temp, hum, led),
+            )
+        conexion.commit()
+        conexion.close()
     except Exception as e:
-        print("Error al registrar telemetría:", e)
+        print("Aviso BD telemetría:", e)
 
+# =====================================================
+# RUTAS DE AUTENTICACIÓN Y ADMINISTRACIÓN
+# =====================================================
 @app.route("/", methods=["GET"])
 def inicio():
-    return jsonify({"sistema": "SmartLab IoT API", "estado": "activo"})
+    return jsonify({
+        "aplicacion": "API SmartLab IoT Pro",
+        "estado": "funcionando",
+        "seguridad": ["HTTPS", "JWT", "RBAC", "CORS"]
+    })
 
 @app.route("/login", methods=["POST"])
 def login():
     datos = request.get_json(silent=True) or {}
-    usr = str(datos.get("usuario", "")).strip()
-    pwd = str(datos.get("password", "")).strip()
-    if usr not in USUARIOS or USUARIOS[usr]["password"] != pwd:
-        return jsonify({"mensaje": "Credenciales inválidas"}), 401
+    usuario = str(datos.get("usuario", "")).strip()
+    password = str(datos.get("password", "")).strip()
+
+    if not usuario or not password:
+        return jsonify({"mensaje": "Debe ingresar usuario y contraseña"}), 400
+    if usuario not in USUARIOS or USUARIOS[usuario]["password"] != password:
+        return jsonify({"mensaje": "Usuario o contraseña incorrectos"}), 401
+
     token = jwt.encode(
-        {"usuario": usr, "rol": USUARIOS[usr]["rol"], "exp": datetime.now(timezone.utc) + timedelta(hours=3)},
+        {
+            "usuario": usuario,
+            "rol": USUARIOS[usuario]["rol"],
+            "exp": datetime.now(timezone.utc) + timedelta(hours=3)
+        },
         SECRET_KEY,
         algorithm="HS256"
     )
-    return jsonify({"mensaje": "Acceso correcto", "usuario": usr, "rol": USUARIOS[usr]["rol"], "token": token})
-
-@app.route("/perfil", methods=["GET"])
-@token_required
-def perfil(datos):
-    return jsonify({"usuario": datos["usuario"], "rol": datos["rol"]})
+    return jsonify({
+        "mensaje": "Autenticación exitosa",
+        "usuario": usuario,
+        "rol": USUARIOS[usuario]["rol"],
+        "token": token
+    })
 
 @app.route("/usuarios", methods=["GET"])
 @token_required
-def usuarios(datos):
+def listar_usuarios(datos):
     if datos["rol"] != "admin":
         return jsonify({"mensaje": "Acceso denegado. Se requiere rol admin."}), 403
-    return jsonify({"usuarios": list(USUARIOS.keys())})
+    lista = [{"usuario": k, "rol": v["rol"]} for k, v in USUARIOS.items()]
+    return jsonify({"usuarios": lista})
 
+# =====================================================
+# RUTAS DE CONTROL IOT Y MODO AUTOMÁTICO
+# =====================================================
 @app.route("/led/status", methods=["GET"])
-def get_led():
+def led_status():
     return jsonify(iot_state)
 
 @app.route("/led/on", methods=["POST"])
 @token_required
-def post_led_on(datos):
+def led_on(datos):
     if datos["rol"] != "admin":
-        return jsonify({"mensaje": "Acceso denegado. Rol admin requerido."}), 403
+        return jsonify({"mensaje": "Acceso denegado. Solo admin puede operar la ventilación."}), 403
     iot_state["led"] = True
+    iot_state["modo_auto"] = False
     iot_state["actualizado_por"] = datos["usuario"]
     registrar_telemetria(iot_state["temperatura"], iot_state["humedad"], True)
-    return jsonify({"success": True, "led": True, "message": f"Ventilación activada por {datos['usuario']}"})
+    return jsonify({
+        "success": True,
+        "estado": iot_state,
+        "message": f"Ventilación y compuerta ACTIVADAS por {datos['usuario']}"
+    })
 
 @app.route("/led/off", methods=["POST"])
 @token_required
-def post_led_off(datos):
+def led_off(datos):
     if datos["rol"] != "admin":
-        return jsonify({"mensaje": "Acceso denegado. Rol admin requerido."}), 403
+        return jsonify({"mensaje": "Acceso denegado. Solo admin puede operar la ventilación."}), 403
     iot_state["led"] = False
+    iot_state["modo_auto"] = False
     iot_state["actualizado_por"] = datos["usuario"]
     registrar_telemetria(iot_state["temperatura"], iot_state["humedad"], False)
-    return jsonify({"success": True, "led": False, "message": f"Ventilación apagada por {datos['usuario']}"})
+    return jsonify({
+        "success": True,
+        "estado": iot_state,
+        "message": f"Ventilación y compuerta APAGADAS por {datos['usuario']}"
+    })
+
+@app.route("/led/toggle", methods=["POST"])
+def led_toggle():
+    # Endpoint usado por el botón físico del laboratorio en Wokwi
+    iot_state["led"] = not iot_state["led"]
+    iot_state["modo_auto"] = False
+    iot_state["actualizado_por"] = "boton_esp32"
+    registrar_telemetria(iot_state["temperatura"], iot_state["humedad"], iot_state["led"])
+    return jsonify({
+        "success": True,
+        "estado": iot_state,
+        "message": "Estado alternado desde el pulsador del laboratorio"
+    })
+
+@app.route("/modo/auto", methods=["POST"])
+@token_required
+def toggle_modo_auto(datos):
+    if datos["rol"] != "admin":
+        return jsonify({"mensaje": "Acceso denegado. Solo admin puede cambiar el modo."}), 403
+    req = request.get_json(silent=True) or {}
+    nuevo_modo = bool(req.get("activo", not iot_state["modo_auto"]))
+    iot_state["modo_auto"] = nuevo_modo
+    iot_state["actualizado_por"] = f"{datos['usuario']} (auto)"
+
+    if nuevo_modo:
+        if iot_state["temperatura"] > 28.0:
+            iot_state["led"] = True
+        elif iot_state["temperatura"] < 24.0:
+            iot_state["led"] = False
+
+    return jsonify({
+        "success": True,
+        "estado": iot_state,
+        "message": "Modo Automático (>28°C) ACTIVADO" if nuevo_modo else "Modo Manual ACTIVADO"
+    })
 
 @app.route("/sensor/update", methods=["POST"])
 def sensor_update():
     datos = request.get_json(silent=True) or {}
-    if "temperatura" in datos and "humedad" in datos:
-        iot_state["temperatura"] = float(datos["temperatura"])
+    if "temperatura" in datos:
+        temp = float(datos["temperatura"])
+        iot_state["temperatura"] = temp
+        iot_state["alerta_termica"] = temp > 28.0
+
+        # Lógica automática si está habilitada
+        if iot_state["modo_auto"]:
+            if temp > 28.0 and not iot_state["led"]:
+                iot_state["led"] = True
+                iot_state["actualizado_por"] = "auto_termico"
+            elif temp < 24.0 and iot_state["led"]:
+                iot_state["led"] = False
+                iot_state["actualizado_por"] = "auto_termico"
+
+    if "humedad" in datos:
         iot_state["humedad"] = float(datos["humedad"])
-        registrar_telemetria(iot_state["temperatura"], iot_state["humedad"], iot_state["led"])
+
+    registrar_telemetria(iot_state["temperatura"], iot_state["humedad"], iot_state["led"])
     return jsonify({"success": True, "estado": iot_state})
 
+# =====================================================
+# RUTAS DEL CHATBOT PDF Y SUPABASE
+# =====================================================
 @app.route("/chat", methods=["POST"])
 def chat():
     datos = request.get_json(silent=True) or {}
-    preg = str(datos.get("mensaje", "")).strip()
-    if not preg:
-        return jsonify({"error": "Debe enviar un mensaje"}), 400
+    pregunta = str(datos.get("mensaje", "")).strip()
+    if not pregunta:
+        return jsonify({"error": "Debe enviar el campo 'mensaje'."}), 400
     try:
-        texto = leer_pdf()
-        secciones = extraer_secciones(texto)
-        seccion = detectar_seccion(preg)
-        if seccion:
-            resp = "Según el manual:\n\n" + secciones.get(seccion, "")
+        texto_pdf = leer_pdf()
+        secciones = extraer_secciones(texto_pdf)
+        seccion = detectar_seccion(pregunta)
+
+        if seccion is None:
+            respuesta = (
+                "No encontré una sección específica. Puedes consultar por:\n"
+                "• Protocolo de Climatización\n"
+                "• Ingeniería en Ciberseguridad\n"
+                "• Ingeniería de Sistemas de Información\n"
+                "• Ingeniería de Software\n"
+                "• Ciencia de Datos e Inteligencia Artificial"
+            )
         else:
-            resp = "No encontré un procedimiento para esa consulta. Puedes preguntar por Climatización, Ciberseguridad, Software o Sistemas."
-        guardar_chat(preg, resp)
-        return jsonify({"pregunta": preg, "seccion": seccion, "respuesta": resp})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+            respuesta = "Según el manual oficial:\n\n" + secciones.get(seccion, "")
+
+        guardar_conversacion(pregunta, respuesta)
+        return jsonify({"pregunta": pregunta, "seccion": seccion, "respuesta": respuesta})
+    except Exception as error:
+        return jsonify({"error": str(error)}), 500
 
 @app.route("/historial", methods=["GET"])
 def historial():
     try:
-        conn = obtener_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT id, pregunta, respuesta, fecha_hora FROM conversaciones ORDER BY id DESC LIMIT 15")
-            filas = cur.fetchall()
-        conn.close()
-        return jsonify([{"id": r[0], "pregunta": r[1], "respuesta": r[2], "fecha_hora": r[3].isoformat() if r[3] else None} for r in filas])
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        conexion = obtener_conexion()
+        with conexion.cursor() as cursor:
+            cursor.execute(
+                "SELECT id, pregunta, respuesta, fecha_hora FROM conversaciones ORDER BY id DESC LIMIT 10"
+            )
+            registros = cursor.fetchall()
+        conexion.close()
+        return jsonify([
+            {
+                "id": reg[0],
+                "pregunta": reg[1],
+                "respuesta": reg[2],
+                "fecha_hora": reg[3].isoformat() if reg[3] else None
+            }
+            for reg in registros
+        ])
+    except Exception as error:
+        return jsonify({"error": str(error)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", 5000)), debug=False)
